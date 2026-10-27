@@ -1,0 +1,9 @@
+{
+  "columns": [
+    {"name": "item", "type": "text", "nullable": false},
+    {"name": "units", "type": "integer", "nullable": false},
+    {"name": "unit_price", "type": "decimal", "nullable": false},
+    {"name": "available", "type": "boolean", "nullable": false},
+    {"name": "note", "type": "text", "nullable": true}
+  ]
+}
