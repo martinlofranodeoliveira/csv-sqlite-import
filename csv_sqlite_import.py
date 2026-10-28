@@ -1,4 +1,4 @@
-"""Import a bounded UTF-8 CSV snapshot into a new SQLite database.
+"""Validate a bounded UTF-8 CSV snapshot or import it into a new SQLite database.
 
 Only the Python standard library is used. See README.md for the supported
 schema and filesystem assumptions. All public failures use CsvImportError
@@ -19,10 +19,11 @@ import sqlite3
 import stat
 import sys
 import tempfile
+from collections.abc import Iterator
 from typing import Any
 
-__all__ = ["CsvImportError", "import_csv"]
-__version__ = "1.0.0"
+__all__ = ["CsvImportError", "import_csv", "validate_csv"]
+__version__ = "1.1.0"
 
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_SCHEMA_BYTES = 64 * 1024
@@ -163,6 +164,71 @@ def _convert(value: str, kind: str, nullable: bool) -> Any:
     return result
 
 
+def _prepare_csv(
+    source_path: str, schema: Any, delimiter: str
+) -> tuple[list[str], list[tuple[str, bool]], Iterator[list[str]], str]:
+    snapshot = _snapshot(source_path, MAX_SOURCE_BYTES)
+    digest = hashlib.sha256(snapshot).hexdigest()
+    reader = csv.reader(
+        io.StringIO(snapshot.decode("utf-8-sig"), newline=""),
+        delimiter=delimiter,
+        strict=True,
+    )
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise CsvImportError("Invalid CSV header.") from None
+    _validate_header(header)
+    specifications = _validate_schema(schema, header)
+    return header, specifications, reader, digest
+
+
+def _validated_rows(
+    reader: Iterator[list[str]], specifications: list[tuple[str, bool]]
+) -> Iterator[tuple[Any, ...]]:
+    for index, row in enumerate(reader):
+        if not row or len(row) != len(specifications):
+            raise CsvImportError("Invalid CSV row.")
+        if index >= MAX_ROWS:
+            raise CsvImportError("CSV row limit exceeded.")
+        if any(len(value) > MAX_FIELD_CHARACTERS for value in row):
+            raise CsvImportError("CSV field limit exceeded.")
+        yield tuple(
+            _convert(value, kind, nullable)
+            for value, (kind, nullable) in zip(row, specifications)
+        )
+
+
+def _summary(table: str, rows: int, header: list[str], digest: str) -> dict[str, Any]:
+    return {"table": table, "rows": rows, "columns": header, "sha256": digest}
+
+
+def validate_csv(
+    source: str | os.PathLike[str],
+    *,
+    table: str = "records",
+    schema: dict[str, Any] | None = None,
+    delimiter: str = ",",
+) -> dict[str, Any]:
+    """Check every CSV record and return an import-compatible summary.
+
+    This reads the source without modifying it and creates no output files or
+    SQLite connections. It cannot guarantee a later import's destination or
+    SQLite availability. Invalid input raises a private CsvImportError.
+    """
+    try:
+        _validate_options(table, delimiter)
+        header, specifications, reader, digest = _prepare_csv(
+            _path(source), schema, delimiter
+        )
+        rows = sum(1 for _ in _validated_rows(reader, specifications))
+        return _summary(table, rows, header, digest)
+    except CsvImportError:
+        raise
+    except (OSError, ValueError, TypeError, csv.Error, OverflowError):
+        raise CsvImportError("CSV validation failed.") from None
+
+
 def _remove_stage(stage: str | None) -> None:
     if stage is None:
         return
@@ -205,19 +271,9 @@ def import_csv(
         else:
             raise CsvImportError("Destination already exists.")
 
-        snapshot = _snapshot(source_path, MAX_SOURCE_BYTES)
-        digest = hashlib.sha256(snapshot).hexdigest()
-        reader = csv.reader(
-            io.StringIO(snapshot.decode("utf-8-sig"), newline=""),
-            delimiter=delimiter,
-            strict=True,
+        header, specifications, reader, digest = _prepare_csv(
+            source_path, schema, delimiter
         )
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise CsvImportError("Invalid CSV header.") from None
-        _validate_header(header)
-        specifications = _validate_schema(schema, header)
 
         parent = os.path.dirname(destination_path) or "."
         descriptor, stage = tempfile.mkstemp(
@@ -242,17 +298,7 @@ def import_csv(
             + ")"
         )
         rows = 0
-        for row in reader:
-            if not row or len(row) != len(header):
-                raise CsvImportError("Invalid CSV row.")
-            if rows >= MAX_ROWS:
-                raise CsvImportError("CSV row limit exceeded.")
-            if any(len(value) > MAX_FIELD_CHARACTERS for value in row):
-                raise CsvImportError("CSV field limit exceeded.")
-            values = tuple(
-                _convert(value, kind, nullable)
-                for value, (kind, nullable) in zip(row, specifications)
-            )
+        for values in _validated_rows(reader, specifications):
             connection.execute(statement, values)
             rows += 1
         if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
@@ -263,7 +309,7 @@ def import_csv(
         # link() is the no-overwrite publication operation, including when a
         # competing importer creates the destination after our initial check.
         os.link(stage, destination_path)
-        return {"table": table, "rows": rows, "columns": header, "sha256": digest}
+        return _summary(table, rows, header, digest)
     except CsvImportError:
         raise
     except (OSError, ValueError, TypeError, csv.Error, sqlite3.Error, OverflowError):
@@ -314,24 +360,35 @@ class _Parser(argparse.ArgumentParser):
 
 def main(argv: list[str] | None = None) -> int:
     """Command-line entry point; errors never print data, SQL, or paths."""
-    parser = _Parser(description="Import UTF-8 CSV into a new SQLite database.")
+    parser = _Parser(description="Validate UTF-8 CSV or import into a new SQLite database.")
     parser.add_argument("CSV", help="source CSV file (at most 64 MiB)")
-    parser.add_argument("OUTPUT", help="new destination database file")
+    parser.add_argument(
+        "OUTPUT", nargs="?", help="new destination database file (omit with --check)"
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="validate every record without creating a database"
+    )
     parser.add_argument("--table", default="records", help="table name (default: records)")
     parser.add_argument("--schema", metavar="JSONFILE", help="explicit passive JSON schema")
     parser.add_argument(
         "--delimiter", choices=("comma", "tab", "semicolon"), default="comma"
     )
     arguments = parser.parse_args(argv)
+    if arguments.check and arguments.OUTPUT is not None:
+        parser.error("OUTPUT is not allowed with --check")
+    if not arguments.check and arguments.OUTPUT is None:
+        parser.error("OUTPUT is required for import")
     try:
         schema = _load_schema(arguments.schema) if arguments.schema is not None else None
-        summary = import_csv(
-            arguments.CSV,
-            arguments.OUTPUT,
-            table=arguments.table,
-            schema=schema,
-            delimiter={"comma": ",", "tab": "\t", "semicolon": ";"}[arguments.delimiter],
-        )
+        options = {
+            "table": arguments.table,
+            "schema": schema,
+            "delimiter": {"comma": ",", "tab": "\t", "semicolon": ";"}[arguments.delimiter],
+        }
+        if arguments.check:
+            summary = validate_csv(arguments.CSV, **options)
+        else:
+            summary = import_csv(arguments.CSV, arguments.OUTPUT, **options)
     except CsvImportError:
         sys.stderr.write("error: CSV import failed\n")
         return 2

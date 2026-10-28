@@ -41,6 +41,41 @@ strings. Specify local file paths; shell expansion, directory searches, download
 and input modification are never performed. Relative paths use the process's
 current directory. The output must not exist, even as a broken symlink.
 
+## Validate before importing
+
+Check every record without creating a database:
+
+```sh
+python -m csv_sqlite_import examples/inventory.csv --check \
+  --table inventory --schema examples/inventory.schema.json
+```
+
+`--check` accepts only the source CSV; supplying an output path is an error.
+Success prints the same `table`, `rows`, `columns`, and exact-byte `sha256`
+summary as an import. It applies the same encoding, header, row, delimiter,
+schema, typed-value, and size rules to the entire file, including late records.
+Validation reads the source without changing it, opening SQLite, or creating
+temporary or output files.
+
+The API provides the same input-only check:
+
+```python
+from csv_sqlite_import import CsvImportError, validate_csv
+
+try:
+    summary = validate_csv("examples/inventory.csv", table="inventory")
+except CsvImportError:
+    print("The input could not be validated.")
+else:
+    print(summary)
+```
+
+Run `python -m examples.check_inventory` for an API example that also applies
+the inventory's explicit schema. Validation cannot guarantee destination
+filesystem or SQLite availability for a later import. Each invocation reads
+its own source snapshot; compare `sha256` summaries if the source may change
+between checking and importing.
+
 ## Types and schemas
 
 A schema must have exactly this structure, with columns in the same order and
@@ -128,6 +163,8 @@ load triggers, extensions, or providers.
 
 CLI success exits with status 0 and JSON on stdout. Failure exits with status 2,
 a generic message on stderr, and no JSON output. `--help` exits with status 0.
+Check mode uses the same CLI statuses. `validate_csv` raises `CsvImportError`
+for invalid input or ordinary read failures, with the same private messages.
 
 ## Development
 
@@ -138,6 +175,8 @@ python -m unittest discover -s tests -v
 The public tests use temporary directories and synthetic data. They cover
 publication races, rollback and cleanup, filesystem restrictions, schema/type
 validation, exact digests, SQL-shaped headers, quoting, BOMs, and multiline CSV.
+Validation tests also cover complete input checks, matching import summaries,
+unchanged source files, and rejection of SQLite and publication operations.
 GitHub Actions runs them on Python 3.10, 3.12, and 3.14, with read-only repository
 permissions and checkout credentials disabled. No third-party dependencies are
 required.

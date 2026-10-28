@@ -42,6 +42,41 @@ caminhos de shell, não procura arquivos, não faz downloads e não modifica a
 origem. Caminhos relativos usam a pasta atual do processo. O destino não pode
 existir, nem mesmo como link simbólico quebrado.
 
+## Validar antes de importar
+
+Confira todos os registros sem criar um banco:
+
+```sh
+python -m csv_sqlite_import examples/inventory.csv --check \
+  --table inventory --schema examples/inventory.schema.json
+```
+
+`--check` aceita somente o CSV de origem; informar um caminho de destino causa
+erro. No sucesso, retorna o mesmo resumo de uma importação: `table`, `rows`,
+`columns` e `sha256` dos bytes exatos. Aplica as mesmas regras de codificação,
+cabeçalho, registros, delimitador, esquema, tipos e limites ao arquivo inteiro,
+inclusive aos últimos registros. A validação lê a origem sem modificá-la,
+abrir SQLite ou criar arquivos temporários ou de saída.
+
+A API oferece a mesma verificação da entrada:
+
+```python
+from csv_sqlite_import import CsvImportError, validate_csv
+
+try:
+    resumo = validate_csv("examples/inventory.csv", table="inventory")
+except CsvImportError:
+    print("Não foi possível validar a entrada.")
+else:
+    print(resumo)
+```
+
+Execute `python -m examples.check_inventory` para um exemplo da API que também
+aplica o esquema explícito do estoque. Validar a entrada não garante a
+disponibilidade do sistema de arquivos do destino nem do SQLite em uma
+importação posterior. Cada execução lê seu próprio snapshot da origem; compare
+os resumos `sha256` se o arquivo puder mudar entre a validação e a importação.
+
 ## Tipos e esquemas
 
 O esquema deve ter exatamente esta estrutura. A ordem e os nomes das colunas
@@ -133,6 +168,9 @@ nem carregamento de triggers, extensões ou provedores.
 
 A CLI retorna status 0 e JSON em stdout no sucesso. Em caso de erro, retorna
 status 2, mensagem genérica em stderr e nenhum JSON. `--help` retorna status 0.
+O modo `--check` usa os mesmos status da CLI. `validate_csv` gera
+`CsvImportError` para entrada inválida ou falhas comuns de leitura, com
+mensagens que também omitem dados privados.
 
 ## Desenvolvimento
 
@@ -143,7 +181,9 @@ python -m unittest discover -s tests -v
 Os testes públicos usam pastas temporárias e dados fictícios. Cobrem concorrência
 na publicação, rollback e limpeza, restrições de arquivos, validação de tipos e
 esquemas, hashes exatos, cabeçalhos semelhantes a SQL, aspas, BOM e campos com
-várias linhas. O GitHub Actions executa os testes no Python 3.10, 3.12 e 3.14,
+várias linhas. Os testes de validação também cobrem a entrada completa, resumos
+iguais aos da importação, preservação da origem e rejeição de operações de
+SQLite e publicação. O GitHub Actions executa os testes no Python 3.10, 3.12 e 3.14,
 com permissões de leitura e credenciais de checkout desativadas. Não há
 dependências externas.
 
